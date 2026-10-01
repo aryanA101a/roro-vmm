@@ -22,6 +22,8 @@
 #define E820_LOW_RAM_END 0x0009fc00
 #define E820_ENTRY_TYPE_RAM 1
 #define E820_ENTRY_TYPE_RESERVED 2
+#define KVM_IDENTITY_MAP_GPA 0xfffbc000ULL
+#define KVM_TSS_GPA 0xfffbd000UL
 #define MIN_KERNEL_FILE_SIZE 0x208
 #define SETUP_HEADER_OFFSET 0x1f1
 #define SETUP_HEADER_END_BASE 0x202
@@ -32,6 +34,166 @@
 #define LOADER_TYPE_UNDEFINED 0xff
 #define CR0_PE_BIT (1ULL << 0)
 #define CR0_PG_BIT (1ULL << 31)
+
+#define UART_BASE 0x3f8
+
+#define UART_DR 0x01
+#define UART_THRE 0x20
+#define UART_TEMT 0x40
+
+struct uart
+{
+    uint8_t rbr;
+    uint8_t thr;
+    uint8_t ier;
+    uint8_t iir;
+    uint8_t lcr;
+    uint8_t mcr;
+    uint8_t lsr;
+    uint8_t msr;
+    uint8_t scr;
+    uint8_t dll;
+    uint8_t dlm;
+};
+
+static struct uart uart = {
+    .iir = 0x01,                 // no interrupt pending
+    .lsr = UART_THRE | UART_TEMT // transmitter ready/empty
+};
+
+static void uart_tx(uint8_t byte)
+{
+    putchar(byte);
+    fflush(stdout);
+}
+
+void uart_rx(uint8_t byte)
+{
+    /*
+     * Don't overwrite an unread byte.
+     */
+    if (!(uart.lsr & UART_DR))
+    {
+        uart.rbr = byte;
+        uart.lsr |= UART_DR;
+    }
+}
+
+void uart_write(uint16_t port, uint8_t value)
+{
+    uint16_t off = port - UART_BASE;
+    int dlab = uart.lcr & 0x80;
+
+    switch (off)
+    {
+    case 0:
+        if (dlab)
+        {
+            uart.dll = value;
+        }
+        else
+        {
+            uart.thr = value;
+            uart_tx(uart.thr);
+        }
+        break;
+
+    case 1:
+        if (dlab)
+        {
+            uart.dlm = value;
+        }
+        else
+        {
+            uart.ier = value;
+        }
+        break;
+
+    case 2:
+        /*
+         * FCR write.
+         *
+         * We aren't implementing FIFOs yet.
+         * Bit 1 clears receive state.
+         */
+        if (value & 0x02)
+            uart.lsr &= ~UART_DR;
+
+        break;
+
+    case 3:
+        uart.lcr = value;
+        break;
+
+    case 4:
+        uart.mcr = value;
+        break;
+
+    case 7:
+        uart.scr = value;
+        break;
+
+    default:
+        break;
+    }
+}
+
+uint8_t uart_read(uint16_t port)
+{
+    uint16_t off = port - UART_BASE;
+    int dlab = uart.lcr & 0x80;
+
+    switch (off)
+    {
+    case 0:
+        if (dlab)
+        {
+            return uart.dll;
+        }
+        else
+        {
+            uint8_t value = uart.rbr;
+
+            uart.lsr &= ~UART_DR;
+
+            return value;
+        }
+
+    case 1:
+        if (dlab)
+            return uart.dlm;
+
+        return uart.ier;
+
+    case 2:
+        return uart.iir;
+
+    case 3:
+        return uart.lcr;
+
+    case 4:
+        return uart.mcr;
+
+    case 5:
+        return uart.lsr;
+
+    case 6:
+        return uart.msr;
+
+    case 7:
+        return uart.scr;
+
+    default:
+        return 0xff;
+    }
+}
+
+struct rtc
+{
+    uint8_t index;
+};
+
+static struct rtc rtc;
 
 struct mapped_file
 {
@@ -161,7 +323,7 @@ static void inspect_kernel(const struct mapped_file *kernel, struct kern_meta *m
 int main(int argc, char **argv)
 {
     static const char cmdline[] =
-        "console=ttyS0,115200 earlycon=uart8250,io,0x3f8,115200 "
+        "console=ttyS0,115200 earlycon=uart8250,io,0x3f8 "
         "rdinit=/init nokaslr";
     const char *kernel_path, *initramfs_path;
     int kvm, vmfd, vcpufd, ret;
@@ -173,6 +335,7 @@ int main(int argc, char **argv)
     size_t mmap_size;
     struct kvm_run *run;
     uint64_t initramfs_end, initramfs_gpa, kernel_workspace_end;
+    uint32_t pci_config_address = 0;
 
     if (argc != 3)
         errx(1, "usage: %s KERNEL INITRAMFS", argv[0]);
@@ -270,6 +433,24 @@ int main(int argc, char **argv)
     vmfd = ioctl(kvm, KVM_CREATE_VM, (unsigned long)0);
     if (vmfd == -1)
         err(1, "KVM_CREATE_VM");
+
+    uint64_t identity_map_gpa = KVM_IDENTITY_MAP_GPA;
+    ret = ioctl(vmfd, KVM_SET_IDENTITY_MAP_ADDR, &identity_map_gpa);
+    if (ret == -1)
+        err(1, "KVM_SET_IDENTITY_MAP_ADDR");
+    ret = ioctl(vmfd, KVM_SET_TSS_ADDR, KVM_TSS_GPA);
+    if (ret == -1)
+        err(1, "KVM_SET_TSS_ADDR");
+    ret = ioctl(vmfd, KVM_CREATE_IRQCHIP, NULL);
+    if (ret == -1)
+        err(1, "KVM_CREATE_IRQCHIP");
+
+    struct kvm_pit_config pit_config = {
+        .flags = KVM_PIT_SPEAKER_DUMMY,
+    };
+    ret = ioctl(vmfd, KVM_CREATE_PIT2, &pit_config);
+    if (ret == -1)
+        err(1, "KVM_CREATE_PIT2");
 
     struct kvm_userspace_memory_region region = {
         .slot = 0,
@@ -384,16 +565,74 @@ int main(int argc, char **argv)
             puts("KVM_EXIT_HLT");
             return 0;
         case KVM_EXIT_IO:
-            if (run->io.direction == KVM_EXIT_IO_OUT && run->io.size == 1 && run->io.port == 0x3f8 && run->io.count == 1)
-                putchar(*(((char *)run) + run->io.data_offset));
+        {
+            uint8_t *data = (uint8_t *)run + run->io.data_offset;
+
+            if (run->io.count != 1)
+                errx(1, "unhandled KVM_EXIT_IO: port=0x%x size=%u count=%u",
+                     run->io.port, run->io.size, run->io.count);
+
+            if (run->io.port >= 0xcf8 && run->io.port <= 0xcff)
+            {
+                if (run->io.direction == KVM_EXIT_IO_OUT)
+                {
+                    // ignore PCI config writes for now
+                }
+                else
+                {
+                    // indicate "no device present"
+                    data[0] = 0xff;
+                }
+
+            }
+
+            else if (run->io.size != 1)
+            {
+                errx(1, "unhandled KVM_EXIT_IO: direction=%s port=0x%x size=%u",
+                     run->io.direction == KVM_EXIT_IO_IN ? "in" : "out",
+                     run->io.port, run->io.size);
+            }
+            else if (run->io.direction == KVM_EXIT_IO_OUT && (run->io.port >= 0x3f8 && run->io.port <= 0x3ff))
+            {
+                uart_write(run->io.port, data[0]);
+            }
+            else if (run->io.direction == KVM_EXIT_IO_IN && (run->io.port >= 0x3f8 && run->io.port <= 0x3ff))
+            {
+                data[0] = uart_read(run->io.port);
+            }
+            else if (run->io.direction == KVM_EXIT_IO_OUT && run->io.port == 0x70)
+            {
+                rtc.index = data[0];
+            }
+            else if (run->io.direction == KVM_EXIT_IO_IN && run->io.port == 0x71)
+            {
+                data[0] = 0; // Return 0 for all RTC reads
+            }
+            else if (run->io.direction == KVM_EXIT_IO_IN) {
+                memset(data, 0xff, run->io.size * run->io.count);
+            }
+             else if (run->io.direction == KVM_EXIT_IO_OUT) {
+                printf("KVM_EXIT_IO_OUT: port=0x%x size=%u count=%u data=",
+                       run->io.port, run->io.size, run->io.count);
+            }
             else
-                errx(1, "unhandled KVM_EXIT_IO");
+            {
+                errx(1, "unhandled KVM_EXIT_IO: direction=%s port=0x%x",
+                     run->io.direction == KVM_EXIT_IO_IN ? "in" : "out",
+                     run->io.port);
+            }
             break;
+        }
         case KVM_EXIT_FAIL_ENTRY:
             errx(1, "KVM_EXIT_FAIL_ENTRY: hardware_entry_failure_reason = 0x%llx",
                  (unsigned long long)run->fail_entry.hardware_entry_failure_reason);
         case KVM_EXIT_INTERNAL_ERROR:
             errx(1, "KVM_EXIT_INTERNAL_ERROR: suberror = 0x%x", run->internal.suberror);
+        case KVM_EXIT_MMIO:
+            errx(1, "KVM_EXIT_MMIO: %s address=0x%llx length=%u",
+                 run->mmio.is_write ? "write" : "read",
+                 (unsigned long long)run->mmio.phys_addr,
+                 run->mmio.len);
         default:
             errx(1, "exit_reason = 0x%x", run->exit_reason);
         }
