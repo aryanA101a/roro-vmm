@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <linux/kvm.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,7 +12,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <termios.h>
 #include <unistd.h>
+#include <errno.h>
 
 #define GUEST_MEM_SIZE 0x08000000
 #define BOOT_PARAMS_GPA 0x00007000
@@ -40,6 +43,11 @@
 #define UART_DR 0x01
 #define UART_THRE 0x20
 #define UART_TEMT 0x40
+#define UART_IER_RDI 0x01
+#define UART_IER_THRI 0x02
+#define UART_IIR_NO_INT 0x01
+#define UART_IIR_THRI 0x02
+#define UART_IIR_RDI 0x04
 
 struct uart
 {
@@ -57,7 +65,7 @@ struct uart
 };
 
 static struct uart uart = {
-    .iir = 0x01,                 // no interrupt pending
+    .iir = UART_IIR_NO_INT,
     .lsr = UART_THRE | UART_TEMT // transmitter ready/empty
 };
 
@@ -166,6 +174,13 @@ uint8_t uart_read(uint16_t port)
         return uart.ier;
 
     case 2:
+        if ((uart.ier & UART_IER_RDI) && (uart.lsr & UART_DR))
+            uart.iir = UART_IIR_RDI;
+        else if ((uart.ier & UART_IER_THRI) && (uart.lsr & UART_THRE))
+            uart.iir = UART_IIR_THRI;
+        else
+            uart.iir = UART_IIR_NO_INT;
+
         return uart.iir;
 
     case 3:
@@ -194,6 +209,66 @@ struct rtc
 };
 
 static struct rtc rtc;
+
+static struct termios saved_termios;
+static int termios_changed;
+static volatile sig_atomic_t stop_requested;
+
+static void restore_terminal(void)
+{
+    if (termios_changed)
+    {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved_termios);
+        termios_changed = 0;
+    }
+}
+
+static void request_stop(int signal_number)
+{
+    (void)signal_number;
+    stop_requested = 1;
+}
+
+static void configure_terminal(void)
+{
+    struct sigaction action = {
+        .sa_handler = request_stop,
+    };
+    struct termios guest_termios;
+
+    if (tcgetattr(STDIN_FILENO, &saved_termios) == -1)
+        err(1, "tcgetattr stdin");
+
+    guest_termios = saved_termios;
+    guest_termios.c_lflag &= ~(ICANON | ECHO);
+    guest_termios.c_cc[VMIN] = 0;
+    guest_termios.c_cc[VTIME] = 0;
+
+    if (atexit(restore_terminal) != 0)
+        errx(1, "atexit");
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &guest_termios) == -1)
+        err(1, "tcsetattr stdin");
+    termios_changed = 1;
+
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGINT, &action, NULL) == -1)
+        err(1, "sigaction SIGINT");
+}
+
+int read_char(void)
+{
+    unsigned char c;
+
+    ssize_t n = read(STDIN_FILENO, &c, 1);
+
+    if (n == 1)
+        return c;
+
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        return -1; // nothing available
+
+    return -1;
+}
 
 struct mapped_file
 {
@@ -553,17 +628,30 @@ int main(int argc, char **argv)
     ret = ioctl(vcpufd, KVM_SET_REGS, &regs);
     if (ret == -1)
         err(1, "KVM_SET_REGS");
-
+    configure_terminal();
     while (1)
     {
+        if (stop_requested)
+            goto cleanup;
+
+        if (!(uart.lsr & UART_DR))
+        {
+            int c = read_char();
+            if (c != -1)
+                uart_rx((uint8_t)c);
+        }
         ret = ioctl(vcpufd, KVM_RUN, NULL);
         if (ret == -1)
+        {
+            if (errno == EINTR && stop_requested)
+                goto cleanup;
             err(1, "KVM_RUN");
+        }
         switch (run->exit_reason)
         {
         case KVM_EXIT_HLT:
             puts("KVM_EXIT_HLT");
-            return 0;
+            goto cleanup;
         case KVM_EXIT_IO:
         {
             uint8_t *data = (uint8_t *)run + run->io.data_offset;
@@ -583,7 +671,6 @@ int main(int argc, char **argv)
                     // indicate "no device present"
                     data[0] = 0xff;
                 }
-
             }
 
             else if (run->io.size != 1)
@@ -608,10 +695,12 @@ int main(int argc, char **argv)
             {
                 data[0] = 0; // Return 0 for all RTC reads
             }
-            else if (run->io.direction == KVM_EXIT_IO_IN) {
+            else if (run->io.direction == KVM_EXIT_IO_IN)
+            {
                 memset(data, 0xff, run->io.size * run->io.count);
             }
-             else if (run->io.direction == KVM_EXIT_IO_OUT) {
+            else if (run->io.direction == KVM_EXIT_IO_OUT)
+            {
                 printf("KVM_EXIT_IO_OUT: port=0x%x size=%u count=%u data=",
                        run->io.port, run->io.size, run->io.count);
             }
@@ -639,6 +728,7 @@ int main(int argc, char **argv)
     }
 
 cleanup:
+    restore_terminal();
     if (munmap(mem, GUEST_MEM_SIZE) == -1)
         err(1, "munmap guest memory");
     unmap_file(&initramfs);
